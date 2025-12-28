@@ -1,3 +1,4 @@
+# FapuFap
 import os
 import time
 import uuid
@@ -481,3 +482,4 @@ if __name__ == "__main__":
     finally:
         agent.running = False
         logging.info("PC Agent завершил работу")
+
