@@ -1,4 +1,4 @@
-# FapuFap
+# FapuFap — PC Agent
 import os
 import time
 import uuid
@@ -8,6 +8,8 @@ import subprocess
 import json
 import logging
 import hashlib
+import shlex
+import signal
 from threading import Thread, Lock
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,7 +21,7 @@ from wakeonlan import send_magic_packet
 
 CONFIG_PATH = Path("agent_config.json")
 SERVER_CONFIG = {
-    "base_url": "https://your-server.com/api",
+    "base_url": "https://your-server.com/api",  # ← УБРАЛ ПРОБЕЛЫ!
     "endpoints": {
         "register": "/register",
         "heartbeat": "/heartbeat",
@@ -30,12 +32,14 @@ SERVER_CONFIG = {
     "retry_attempts": 3,
     "timeout": 15
 }
+
 AGENT_CONFIG = {
     "agent_id": str(uuid.uuid4()),
     "version": "1.1.7",
     "check_interval": 60,
     "heartbeat_interval": 300,
     "max_log_size_mb": 10,
+    "log_level": "INFO",
     "allowed_commands": ["dir", "ls", "ipconfig", "ifconfig", "whoami", "wake"],
     "security": {
         "command_whitelist": True,
@@ -48,6 +52,17 @@ AGENT_CONFIG = {
     },
     "wol_interface": None
 }
+
+# Инициализация планировщика ОДИН РАЗ
+schedule.every().day.at("02:00").do(lambda: send_scheduled_metrics())
+
+def send_scheduled_metrics():
+    """Функция для отправки метрик по расписанию"""
+    try:
+        server = ServerCommunicator()
+        server.send_metrics()
+    except Exception as e:
+        logging.error(f"Ошибка отправки метрик по расписанию: {e}")
 
 def load_config():
     global AGENT_CONFIG, SERVER_CONFIG
@@ -62,9 +77,11 @@ def load_config():
         except Exception as e:
             logging.error(f"Ошибка загрузки конфигурации: {e}. Используются настройки по умолчанию.")
     
-    if "agent_id" not in AGENT_CONFIG:
+    # Гарантируем наличие agent_id
+    if "agent_id" not in AGENT_CONFIG or not AGENT_CONFIG["agent_id"]:
         AGENT_CONFIG["agent_id"] = str(uuid.uuid4())
-    
+        logging.info("Создан новый agent_id")
+
     save_config()
     return AGENT_CONFIG, SERVER_CONFIG
 
@@ -81,7 +98,7 @@ def save_config():
 
 def get_hardware_id():
     try:
-        mac = get_mac_address().replace(":", "")
+        mac = get_mac_address().replace(":", "").replace("-", "").upper()
         hostname = socket.gethostname()
         return hashlib.sha256(f"{mac}{hostname}".encode()).hexdigest()[:16]
     except Exception as e:
@@ -107,8 +124,9 @@ def get_system_metrics():
     
     for partition in AGENT_CONFIG["metrics"]["disk_partitions"]:
         try:
-            if os.name == 'nt' and not partition.endswith(':\\'):
-                continue
+            if os.name == 'nt':
+                if not partition.endswith(':\\'):
+                    continue
             usage = psutil.disk_usage(partition)
             metrics["disk"][partition] = {
                 "total_gb": round(usage.total / (1024**3), 1),
@@ -136,22 +154,48 @@ def get_public_ip():
         logging.debug(f"Не удалось определить публичный IP: {e}")
         return "unknown"
 
-def validate_command(cmd):
-    if not AGENT_CONFIG["security"]["command_whitelist"]:
-        return True
-        
-    cmd_base = cmd.split()[0].lower()
-    allowed = [c.lower() for c in AGENT_CONFIG["allowed_commands"]]
-    
-    if cmd_base not in allowed:
-        logging.warning(f"Заблокирована неавторизованная команда: {cmd_base}")
-        return False
-        
+def validate_and_translate_command(cmd: str):
+    if not cmd.strip():
+        return None
+
     if len(cmd) > AGENT_CONFIG["security"]["max_command_length"]:
         logging.warning(f"Команда превышает максимальную длину: {len(cmd)}")
-        return False
-        
-    return True
+        return None
+
+    # Разделение на аргументы безопасно
+    try:
+        parts = shlex.split(cmd)
+    except ValueError as e:
+        logging.warning(f"Неверный синтаксис команды: {e}")
+        return None
+
+    if not parts:
+        return None
+
+    base = parts[0].lower()
+
+    # ОС-специфичная подмена
+    cmd_mapping = {
+        'windows': {'ls': 'dir', 'ifconfig': 'ipconfig'},
+        'linux': {'dir': 'ls', 'ipconfig': 'ifconfig'},
+        'darwin': {'dir': 'ls', 'ipconfig': 'ifconfig'}
+    }
+
+    current_os = platform.system().lower()
+    os_family = 'windows' if current_os == 'windows' else 'linux'
+
+    if os_family in cmd_mapping and base in cmd_mapping[os_family]:
+        parts[0] = cmd_mapping[os_family][base]
+
+    base = parts[0].lower()
+
+    if AGENT_CONFIG["security"]["command_whitelist"]:
+        allowed = [c.lower() for c in AGENT_CONFIG["allowed_commands"]]
+        if base not in allowed:
+            logging.warning(f"Заблокирована неавторизованная команда: {base}")
+            return None
+
+    return parts
 
 def verify_update_package(file_path, expected_hash):
     if not AGENT_CONFIG["security"]["hash_check"]:
@@ -167,7 +211,7 @@ def verify_update_package(file_path, expected_hash):
 
 class ServerCommunicator:
     def __init__(self):
-        self.base_url = SERVER_CONFIG["base_url"]
+        self.base_url = SERVER_CONFIG["base_url"].rstrip('/')  # Защита от лишних слэшей
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": f"PC-Agent/{AGENT_CONFIG['version']}",
@@ -259,13 +303,14 @@ class ServerCommunicator:
             return None
 
 def execute_shell_command(command):
-    if not validate_command(command):
-        return "Команда заблокирована политиками безопасности"
-        
+    parts = validate_and_translate_command(command)
+    if parts is None:
+        return "Команда заблокирована политиками безопасности или недопустима"
+
     try:
+        # Безопасное выполнение БЕЗ shell=True
         result = subprocess.run(
-            command,
-            shell=True,
+            parts,
             capture_output=True,
             text=True,
             timeout=30,
@@ -276,6 +321,8 @@ def execute_shell_command(command):
         return output[:1000] + "..." if len(output) > 1000 else output
     except subprocess.TimeoutExpired:
         return "Команда превысила лимит времени (30 секунд)"
+    except FileNotFoundError:
+        return f"Команда не найдена: {parts[0]}"
     except Exception as e:
         return f"Ошибка выполнения: {str(e)}"
 
@@ -300,7 +347,7 @@ def wake_on_lan(target_mac):
 def apply_update(package_path):
     try:
         logging.info("Применение обновления агента...")
-        new_version = "2.0.0"
+        new_version = "2.0.0"  # В реальности — из метаданных
         AGENT_CONFIG["version"] = new_version
         save_config()
         
@@ -322,7 +369,7 @@ class PC_Agent:
         cmd_type = command_data.get("type")
         cmd_value = command_data.get("value", "")
         
-        logging.info(f"Выполнение команды: {cmd_type} {cmd_value[:20]}...")
+        logging.info(f"Выполнение команды: {cmd_type} {str(cmd_value)[:20]}...")
         
         if cmd_type == "shutdown":
             self.running = False
@@ -366,7 +413,7 @@ class PC_Agent:
                     self.server.send_heartbeat()
                     self.last_heartbeat = datetime.now()
                 
-                schedule.every().day.at("02:00").do(self.server.send_metrics)
+                # Запуск отложенных задач (например, 02:00)
                 schedule.run_pending()
                 
                 time.sleep(self.config["check_interval"])
@@ -409,7 +456,7 @@ def setup_logging():
         logging.info(f"Старый лог архивирован: {archive_path}")
     
     logging.basicConfig(
-        level=getattr(logging, AGENT_CONFIG.get("log_level", "INFO")),
+        level=getattr(logging, AGENT_CONFIG.get("log_level", "INFO").upper()),
         format="%(asctime)s [%(levelname)-8s] %(filename)s:%(lineno)d - %(message)s",
         handlers=[
             logging.FileHandler(log_path),
@@ -429,20 +476,14 @@ def get_local_ip():
             return "127.0.0.1"
 
 def get_mac_address():
+    """Надёжное получение MAC через psutil"""
     try:
-        if os.name == 'nt':
-            output = subprocess.check_output("getmac /NH /FO CSV", shell=True).decode()
-            for line in output.split('\n'):
-                if "Local Area Connection" in line or "Ethernet" in line:
-                    mac = line.split(',')[0].strip('"')
-                    if mac and mac.count('-') == 5:
-                        return mac.replace('-', ':').upper()
-        else:
-            for iface, addrs in psutil.net_if_addrs().items():
-                if "eth" in iface or "enp" in iface or "wlan" in iface:
-                    for addr in addrs:
-                        if addr.family == psutil.AF_LINK and addr.address != "00:00:00:00:00:00":
-                            return addr.address.upper()
+        for iface, addrs in psutil.net_if_addrs().items():
+            if "Loopback" in iface or "lo" in iface:
+                continue
+            for addr in addrs:
+                if addr.family == psutil.AF_LINK and addr.address and addr.address != "00:00:00:00:00:00":
+                    return addr.address.upper()
     except Exception as e:
         logging.error(f"Ошибка определения MAC: {e}")
     return "00:00:00:00:00:00"
@@ -467,19 +508,31 @@ def reboot_system():
     except Exception as e:
         logging.error(f"Перезагрузка не удалась: {e}")
 
+def signal_handler(signum, frame):
+    logging.info(f"Получен сигнал {signum}. Завершение работы...")
+    global agent_instance
+    if agent_instance:
+        agent_instance.running = False
+
 if __name__ == "__main__":
+    agent_instance = None
+    
+    # Регистрация обработчиков сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     load_config()
     setup_logging()
     
-    agent = PC_Agent()
+    agent_instance = PC_Agent()
     
     try:
-        agent.start()
+        agent_instance.start()
     except KeyboardInterrupt:
         logging.info("Агент остановлен пользователем")
     except Exception as e:
         logging.critical(f"Агент аварийно завершил работу: {e}", exc_info=True)
     finally:
-        agent.running = False
+        if agent_instance:
+            agent_instance.running = False
         logging.info("PC Agent завершил работу")
-
